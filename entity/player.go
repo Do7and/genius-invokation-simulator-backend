@@ -11,7 +11,7 @@ import (
 type PlayerInfo interface {
 	UID() uint
 	Name() string
-	Cards()
+	Cards() []Card
 	Characters() map[uint]Character
 }
 
@@ -22,8 +22,13 @@ type Player interface {
 	ReRollTimes() uint
 	StaticCost() Cost
 	HoldingCost() Cost
+	SwitchNextCharacter()
+	SwitchPrevCharacter()
 	SwitchCharacter(target uint)
+	ExecuteCallbackModify(ctx *context.CallbackContext)
+	ExecuteElementAttachment(ctx *context.DamageContext)
 	ExecuteAttack(skill, target uint, background []uint) (result *context.DamageContext)
+	ExecuteDefence(ctx *context.DamageContext)
 	ExecuteModify(ctx *context.ModifierContext)
 	ExecuteCharge(ctx *context.ChargeContext)
 	ExecuteHeal(ctx *context.HealContext)
@@ -31,6 +36,16 @@ type Player interface {
 	ExecuteElementObtain(obtain Cost)
 	ExecuteElementReRoll(drop Cost)
 	ExecuteBurnCard(card uint, exchangeElement enum.ElementType)
+	ExecuteEatFood(card, targetCharacter uint)
+	ExecuteDirectAttackModifiers(ctx *context.DamageContext)
+	ExecuteFinalAttackModifiers(ctx *context.DamageContext)
+	ExecuteAfterAttackCallback()
+	ExecuteAfterDefenceCallback()
+
+	GetActiveCharacter() (has bool, character Character)
+	GetCharacter(id uint) (has bool, character Character)
+	GetBackgroundCharacters() (characters []Character)
+	Defeated() bool
 }
 
 type player struct {
@@ -41,12 +56,13 @@ type player struct {
 	reRollTimes uint // reRollTimes 重新投掷的次数
 	staticCost  Cost // staticCost 每回合投掷阶段固定产出的骰子
 
-	holdingCost     Cost                    // holdingCost 玩家持有的骰子
-	holdingCards    kv.Map[uint, uint]      // holdingCards 玩家持有的卡牌
-	activeCharacter uint                    // activeCharacter 玩家当前的前台角色
-	characters      kv.Map[uint, Character] // characters 玩家出战的角色
-	summons         kv.Map[uint, Summon]    // summons 玩家在场的召唤物
-	supports        kv.Map[uint, Support]   // supports 玩家在场的支援
+	holdingCost     Cost                           // holdingCost 玩家持有的骰子
+	cardDeck        CardDeck                       // cardDeck 玩家的牌堆
+	holdingCards    kv.Map[uint, Card]             // holdingCards 玩家持有的卡牌
+	activeCharacter uint                           // activeCharacter 玩家当前的前台角色
+	characters      kv.OrderedMap[uint, Character] // characters 玩家出战的角色
+	summons         kv.OrderedMap[uint, Summon]    // summons 玩家在场的召唤物
+	supports        kv.OrderedMap[uint, Support]   // supports 玩家在场的支援
 
 	globalDirectAttackModifiers AttackModifiers  // globalDirectAttackModifiers 全局直接攻击修正
 	globalFinalAttackModifiers  AttackModifiers  // globalFinalAttackModifiers 全局最终攻击修正
@@ -66,7 +82,73 @@ func (p *player) executeCharacterModify(ctx *context.ModifierContext) {
 	})
 }
 
-func (p *player) executeCallbackModify(ctx *context.CallbackContext) {
+func (p *player) executeCallbackEvent(trigger enum.TriggerType) {
+	ctx := context.NewCallbackContext()
+	p.callbackEvents.Call(trigger, ctx)
+	p.ExecuteCallbackModify(ctx)
+}
+
+func (p player) UID() uint {
+	return p.uid
+}
+
+func (p player) Name() string {
+	return p.name
+}
+
+func (p player) Operated() bool {
+	return p.operated
+}
+
+func (p player) ReRollTimes() uint {
+	return p.reRollTimes
+}
+
+func (p player) StaticCost() Cost {
+	return p.staticCost
+}
+
+func (p player) HoldingCost() Cost {
+	return p.holdingCost
+}
+
+func (p *player) GetCharacter(id uint) (has bool, character Character) {
+	return p.characters.Exists(id), p.characters.Get(id)
+}
+
+func (p *player) GetActiveCharacter() (has bool, character Character) {
+	if character = p.characters.Get(p.activeCharacter); character.Status() != enum.CharacterStatusDefeated {
+		return true, character
+	} else {
+		return false, nil
+	}
+}
+
+func (p *player) GetBackgroundCharacters() (characters []Character) {
+	characters = []Character{}
+	p.characters.Range(func(k uint, v Character) bool {
+		if k != p.activeCharacter && v.Status() != enum.CharacterStatusDefeated {
+			characters = append(characters, v)
+		}
+		return true
+	})
+
+	return characters
+}
+
+func (p *player) Defeated() bool {
+	tag := true
+	p.characters.Range(func(k uint, v Character) bool {
+		if v.Status() != enum.CharacterStatusDefeated {
+			tag = false
+			return false
+		}
+		return true
+	})
+	return tag
+}
+
+func (p *player) ExecuteCallbackModify(ctx *context.CallbackContext) {
 	// 执行ElementChangeResult
 	changeElementResult := ctx.ChangeElementsResult()
 	addElement, removeElement := map[enum.ElementType]uint{}, map[enum.ElementType]uint{}
@@ -100,53 +182,71 @@ func (p *player) executeCallbackModify(ctx *context.CallbackContext) {
 
 	// 执行GetCard
 	if ctx.GetCardsResult() > 0 {
-		// todo: implement me
-		panic("implement card-deck")
+		for i := uint(0); i < ctx.GetCardsResult(); i++ {
+			if card, success := p.cardDeck.GetOne(); success {
+				p.holdingCards.Set(card.ID(), card)
+			}
+		}
+	}
+
+	// 执行FindCard
+	if find, target := ctx.GetFindCardResult(); find {
+		if card, success := p.cardDeck.FindOne(target); success {
+			p.holdingCards.Set(card.ID(), card)
+		}
 	}
 
 	// 执行ElementAttachment
 	attachment := ctx.AttachElementResult()
-	for target := range attachment {
+	for target, element := range attachment {
 		if p.characters.Exists(target) {
-			// todo: implement me
-			panic("implement rule.reaction")
+			p.characters.Get(target).ExecuteElementAttachment(element)
 		}
 	}
-
 }
 
-func (p *player) executeCallbackEvent(trigger enum.TriggerType) {
-	ctx := context.NewCallbackContext()
-	p.callbackEvents.Call(trigger, ctx)
-	p.executeCallbackModify(ctx)
+func (p *player) ExecuteElementAttachment(ctx *context.DamageContext) {
+	for target, damage := range ctx.Damage() {
+		p.characters.Get(target).ExecuteElementAttachment(damage.ElementType())
+	}
 }
 
-func (p player) UID() uint {
-	return p.uid
+func (p *player) SwitchNextCharacter() {
+	// notice: 如果只有一人，此处不进行切换
+	index := p.characters.GetIndex(p.activeCharacter)
+	for i := index + 1; i < p.characters.Length(); i++ {
+		if character := p.characters.Get(p.characters.GetKey(i)); character.Status() != enum.CharacterStatusDefeated {
+			p.SwitchCharacter(character.ID())
+			return
+		}
+	}
+	for i := uint(0); i < index; i++ {
+		if character := p.characters.Get(p.characters.GetKey(i)); character.Status() != enum.CharacterStatusDefeated {
+			p.SwitchCharacter(character.ID())
+			return
+		}
+	}
 }
 
-func (p player) Name() string {
-	return p.name
-}
-
-func (p player) Operated() bool {
-	return p.operated
-}
-
-func (p player) ReRollTimes() uint {
-	return p.reRollTimes
-}
-
-func (p player) StaticCost() Cost {
-	return p.staticCost
-}
-
-func (p player) HoldingCost() Cost {
-	return p.holdingCost
+func (p *player) SwitchPrevCharacter() {
+	// notice: 如果只有一人，此处不进行切换
+	index := p.characters.GetIndex(p.activeCharacter)
+	for i := int(index - 1); i >= 0; i-- {
+		if character := p.characters.Get(p.characters.GetKey(uint(i))); character.Status() != enum.CharacterStatusDefeated {
+			p.SwitchCharacter(character.ID())
+			return
+		}
+	}
+	for i := p.characters.Length(); i > index; i-- {
+		if character := p.characters.Get(p.characters.GetKey(i)); character.Status() != enum.CharacterStatusDefeated {
+			p.SwitchCharacter(character.ID())
+			return
+		}
+	}
 }
 
 func (p *player) SwitchCharacter(target uint) {
-	if p.characters.Exists(target) {
+	if p.characters.Exists(target) && p.activeCharacter != target {
 		p.characters.Get(p.activeCharacter).SwitchDown()
 		p.activeCharacter = target
 		p.characters.Get(target).SwitchUp()
@@ -269,6 +369,31 @@ func (p *player) ExecuteAttack(skill, target uint, background []uint) (result *c
 	return p.characters.Get(p.activeCharacter).ExecuteAttack(skill, target, background)
 }
 
+func (p *player) ExecuteDirectAttackModifiers(ctx *context.DamageContext) {
+	p.globalDirectAttackModifiers.Execute(ctx)
+	p.characters.Get(p.activeCharacter).ExecuteDirectAttackModifiers(ctx)
+}
+
+func (p *player) ExecuteFinalAttackModifiers(ctx *context.DamageContext) {
+	p.globalFinalAttackModifiers.Execute(ctx)
+	p.characters.Get(p.activeCharacter).ExecuteFinalAttackModifiers(ctx)
+}
+
+func (p *player) ExecuteDefence(ctx *context.DamageContext) {
+	p.globalDefenceModifiers.Execute(ctx)
+	for target := range ctx.Damage() {
+		p.characters.Get(target).ExecuteDefence(ctx)
+	}
+}
+
+func (p *player) ExecuteAfterAttackCallback() {
+	p.executeCallbackEvent(enum.AfterAttack)
+}
+
+func (p *player) ExecuteAfterDefenceCallback() {
+	p.executeCallbackEvent(enum.AfterDefence)
+}
+
 func (p *player) ExecuteElementPayment(basic, pay Cost) (success bool) {
 	if p.PreviewElementCost(basic).Equals(pay) {
 		ctx := context.NewCostContext()
@@ -292,10 +417,22 @@ func (p *player) ExecuteElementReRoll(drop Cost) {
 }
 
 func (p *player) ExecuteBurnCard(card uint, exchangeElement enum.ElementType) {
-	if p.holdingCards.Get(card) != 0 && p.holdingCost.costs[exchangeElement] != 0 {
+	// 玩家持有卡牌、被转换元素不是通用元素且被转换元素数量大于0时，才可以转换
+	if p.holdingCards.Exists(card) && exchangeElement != enum.ElementCurrency && p.holdingCost.costs[exchangeElement] != 0 {
 		p.holdingCost.sub(exchangeElement, 1)
-		p.holdingCards.Set(card, p.holdingCards.Get(card)-1)
+		p.holdingCards.Remove(card)
 		p.holdingCost.add(p.characters.Get(p.activeCharacter).Vision(), 1)
+	}
+}
+
+func (p *player) ExecuteEatFood(card, targetCharacter uint) {
+	if p.holdingCards.Exists(card) && p.holdingCards.Get(card).Type() == enum.CardFood && p.characters.Exists(targetCharacter) {
+		if food, ok := p.holdingCards.Get(card).(FoodCard); ok {
+			ctx := context.NewModifierContext()
+			food.ExecuteModify(ctx)
+			p.characters.Get(targetCharacter).ExecuteEatFood(ctx)
+			p.executeCallbackEvent(enum.AfterEatFood)
+		}
 	}
 }
 
@@ -307,11 +444,12 @@ func NewPlayer(info PlayerInfo) Player {
 		reRollTimes:                 1,
 		staticCost:                  *NewCost(),
 		holdingCost:                 *NewCost(),
-		holdingCards:                kv.NewSimpleMap[uint](),
+		cardDeck:                    *NewCardDeck(info.Cards()),
+		holdingCards:                kv.NewSimpleMap[Card](),
 		activeCharacter:             0,
-		characters:                  kv.NewSimpleMap[Character](),
-		summons:                     kv.NewSimpleMap[Summon](),
-		supports:                    kv.NewSimpleMap[Support](),
+		characters:                  kv.NewOrderedMap[uint, Character](),
+		summons:                     kv.NewOrderedMap[uint, Summon](),
+		supports:                    kv.NewOrderedMap[uint, Support](),
 		globalDirectAttackModifiers: modifier.NewChain[context.DamageContext](),
 		globalFinalAttackModifiers:  modifier.NewChain[context.DamageContext](),
 		globalDefenceModifiers:      modifier.NewChain[context.DamageContext](),
