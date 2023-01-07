@@ -10,14 +10,16 @@ import (
 
 type PlayerInfo interface {
 	UID() uint
-	Name() string
 	Cards() []Card
 	Characters() map[uint]Character
+	SetUID(uint)
+	SetCards([]Card)
+	SetCharacters([]Character)
 }
 
 type Player interface {
 	UID() uint
-	Name() string
+	Status() enum.PlayerStatus
 	Operated() bool
 	ReRollTimes() uint
 	StaticCost() Cost
@@ -41,16 +43,31 @@ type Player interface {
 	ExecuteFinalAttackModifiers(ctx *context.DamageContext)
 	ExecuteAfterAttackCallback()
 	ExecuteAfterDefenceCallback()
+	ExecuteResetCallback()
+	ExecuteRoundEndCallback()
+	ExecuteRoundStartCallback()
+	ExecuteSummonSkills()
+	ExecuteAddSummonRounds(summon uint, rounds uint)
+	ExecuteRemoveSummon(summon uint)
+	ExecuteRemoveAllSummons()
+	ExecuteSkipRound()
+	ExecuteConcede()
+
+	PreviewElementCost(basic Cost) (result Cost)
+
+	ResetOperated()
+	SetHoldingCost(cost Cost)
 
 	GetActiveCharacter() (has bool, character Character)
 	GetCharacter(id uint) (has bool, character Character)
 	GetBackgroundCharacters() (characters []Character)
+	HeldCard(card uint) (held bool)
 	Defeated() bool
 }
 
 type player struct {
-	uid  uint   // uid 玩家的UID，由其他模块托管
-	name string // name 玩家的名称
+	uid    uint              // uid 玩家的UID，由其他模块托管
+	status enum.PlayerStatus // status 玩家的状态
 
 	operated    bool // operated 本回合玩家是否操作过
 	reRollTimes uint // reRollTimes 重新投掷的次数
@@ -92,8 +109,8 @@ func (p player) UID() uint {
 	return p.uid
 }
 
-func (p player) Name() string {
-	return p.name
+func (p player) Status() enum.PlayerStatus {
+	return p.status
 }
 
 func (p player) Operated() bool {
@@ -136,6 +153,10 @@ func (p *player) GetBackgroundCharacters() (characters []Character) {
 	return characters
 }
 
+func (p player) HeldCard(card uint) (held bool) {
+	return p.holdingCards.Exists(card)
+}
+
 func (p *player) Defeated() bool {
 	tag := true
 	p.characters.Range(func(k uint, v Character) bool {
@@ -150,25 +171,28 @@ func (p *player) Defeated() bool {
 
 func (p *player) ExecuteCallbackModify(ctx *context.CallbackContext) {
 	// 执行ElementChangeResult
-	changeElementResult := ctx.ChangeElementsResult()
-	addElement, removeElement := map[enum.ElementType]uint{}, map[enum.ElementType]uint{}
-	for element, amount := range changeElementResult.Cost() {
-		if amount > 0 {
-			addElement[element] += uint(amount)
-		} else {
-			removeElement[element] += uint(-amount)
+	if ok, changeElementResult := ctx.ChangeElementsResult(); ok {
+		addElement, removeElement := map[enum.ElementType]uint{}, map[enum.ElementType]uint{}
+		for element, amount := range changeElementResult.Cost() {
+			if amount > 0 {
+				addElement[element] += uint(amount)
+			} else {
+				removeElement[element] += uint(-amount)
+			}
 		}
+		p.holdingCost.Pay(*NewCostFromMap(removeElement))
+		p.holdingCost.Add(*NewCostFromMap(addElement))
 	}
-	p.holdingCost.Pay(*NewCostFromMap(removeElement))
-	p.holdingCost.Add(*NewCostFromMap(addElement))
 
 	// 执行ChargeChangeResult
-	changeChargeResult := ctx.ChangeChargeResult()
-	p.ExecuteCharge(&changeChargeResult)
+	if ok, changeChargeResult := ctx.ChangeChargeResult(); ok {
+		p.ExecuteCharge(changeChargeResult)
+	}
 
 	// 执行ModifiersChangeResult
-	changeModifiersResult := ctx.ChangeModifiersResult()
-	p.ExecuteModify(&changeModifiersResult)
+	if ok, changeModifiersResult := ctx.ChangeModifiersResult(); ok {
+		p.ExecuteModify(changeModifiersResult)
+	}
 
 	// 执行OperatedResult
 	if switched, result := ctx.ChangeOperatedResult(); switched {
@@ -181,8 +205,8 @@ func (p *player) ExecuteCallbackModify(ctx *context.CallbackContext) {
 	}
 
 	// 执行GetCard
-	if ctx.GetCardsResult() > 0 {
-		for i := uint(0); i < ctx.GetCardsResult(); i++ {
+	if ok, result := ctx.GetCardsResult(); ok && result > 0 {
+		for i := uint(0); i < result; i++ {
 			if card, success := p.cardDeck.GetOne(); success {
 				p.holdingCards.Set(card.ID(), card)
 			}
@@ -197,10 +221,11 @@ func (p *player) ExecuteCallbackModify(ctx *context.CallbackContext) {
 	}
 
 	// 执行ElementAttachment
-	attachment := ctx.AttachElementResult()
-	for target, element := range attachment {
-		if p.characters.Exists(target) {
-			p.characters.Get(target).ExecuteElementAttachment(element)
+	if ok, attachment := ctx.AttachElementResult(); ok {
+		for target, element := range attachment {
+			if p.characters.Exists(target) {
+				p.characters.Get(target).ExecuteElementAttachment(element)
+			}
 		}
 	}
 }
@@ -394,6 +419,43 @@ func (p *player) ExecuteAfterDefenceCallback() {
 	p.executeCallbackEvent(enum.AfterDefence)
 }
 
+func (p *player) ExecuteResetCallback() {
+	p.status = enum.PlayerStatusWaiting
+	p.executeCallbackEvent(enum.AfterReset)
+}
+
+func (p *player) ExecuteRoundEndCallback() {
+	p.status = enum.PlayerStatusWaiting
+	p.executeCallbackEvent(enum.AfterRoundEnd)
+}
+
+func (p *player) ExecuteRoundStartCallback() {
+	p.status = enum.PlayerStatusReady
+	p.executeCallbackEvent(enum.AfterRoundStart)
+}
+
+func (p *player) ExecuteSkipRound() {
+	p.status = enum.PlayerStatusWaiting
+	p.operated = true
+}
+
+func (p *player) ExecuteConcede() {
+	p.status = enum.PlayerStatusDefeated
+}
+
+func (p *player) ResetOperated() {
+	p.status = enum.PlayerStatusActing
+	p.operated = false
+}
+
+func (p *player) ExecuteSummonSkills() {}
+
+func (p *player) ExecuteAddSummonRounds(summon uint, rounds uint) {}
+
+func (p *player) ExecuteRemoveSummon(summon uint) {}
+
+func (p *player) ExecuteRemoveAllSummons() {}
+
 func (p *player) ExecuteElementPayment(basic, pay Cost) (success bool) {
 	if p.PreviewElementCost(basic).Equals(pay) {
 		ctx := context.NewCostContext()
@@ -422,6 +484,7 @@ func (p *player) ExecuteBurnCard(card uint, exchangeElement enum.ElementType) {
 		p.holdingCost.sub(exchangeElement, 1)
 		p.holdingCards.Remove(card)
 		p.holdingCost.add(p.characters.Get(p.activeCharacter).Vision(), 1)
+		p.executeCallbackEvent(enum.AfterBurnCard)
 	}
 }
 
@@ -436,10 +499,14 @@ func (p *player) ExecuteEatFood(card, targetCharacter uint) {
 	}
 }
 
+func (p *player) SetHoldingCost(cost Cost) {
+	p.holdingCost = cost
+}
+
 func NewPlayer(info PlayerInfo) Player {
 	player := &player{
 		uid:                         info.UID(),
-		name:                        info.Name(),
+		status:                      enum.PlayerStatusViewing,
 		operated:                    false,
 		reRollTimes:                 1,
 		staticCost:                  *NewCost(),
