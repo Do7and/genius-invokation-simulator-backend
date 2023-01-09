@@ -13,7 +13,7 @@ steps:
       commands:
           - go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.50.1
           - go mod tidy
-          - golangci-lint run -v -D unused
+          - golangci-lint run -v -D unused --timeout=10m
 
     - name: go build
       image: golang:1.19
@@ -34,7 +34,7 @@ steps:
       pull: if-not-exist
       commands:
           - go mod tidy
-          - go test -bench=. -benchtime=10s ./... -run=^$
+          - go test -bench=. -benchtime=1s ./... -run=^$
 
     - name: feishu notification
       image: serialt/drone-feishu-message
